@@ -17,11 +17,81 @@ Or run from the command line:
 
     python -m devserver app.yaml
 """
+import datetime
+import functools
+import mimetypes
 import os
+import re
 import typing
+
+import werkzeug
+import werkzeug.http
+import werkzeug.wsgi
 
 
 DEFAULT_SERVICE_YAML = 'app.yaml'
+DEFAULT_CONTENT_TYPE = 'text/plain'
+
+
+class App(object):
+    def __init__(self, routes):
+        self._dispatch = {}
+
+        for pattern, func in routes:
+            if isinstance(pattern, str):
+                pattern = re.compile(pattern)
+
+            self._dispatch[pattern] = func
+
+    def __call__(self, environ, start_response):
+        path_info = werkzeug.wsgi.get_path_info(environ)
+
+        for pattern in self._dispatch:
+            match = pattern.search(path_info)
+
+            if match:
+                groups = match.groups()
+                handler = self._dispatch[pattern]
+
+                return handler(environ, start_response)
+
+        return self.not_found(environ, start_response)
+
+    @classmethod
+    def static_dir(cls, url_pattern, static_dir, environ, start_response):
+        path_info = werkzeug.wsgi.get_path_info(environ)
+
+        try:
+            # If it is a match we get a pair of ['', '/filename.txt'].
+             _, remainder = url_pattern.split(path_info)
+        except ValueError:
+            return cls.not_found(environ, start_response)
+
+        remainder = remainder.lstrip('/')
+        filename = os.path.join(static_dir, remainder)
+        content_type = mimetypes.guess_type(filename) or DEFAULT_CONTENT_TYPE
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(filename))
+        size = int(os.path.getsize(filename))
+
+        headers = [
+            ('Date', werkzeug.http.http_date()),
+            ('Content-Type', content_type),
+            ('Content-Length', str(size)),
+            ('Last-Modified', werkzeug.http.http_date(mtime)),
+            ('Cache-Control', 'public'),
+        ]
+
+        fh = open(filename, 'rb')
+        start_response('200 OK', headers)
+        response = werkzeug.wsgi.wrap_file(environ, fh)
+
+        return response
+
+    @classmethod
+    def not_found(cls, environ, start_response):
+        response = werkzeug.Response('Not Found', status=404)
+
+        return response(environ, start_response)
 
 
 def is_gae(env: dict) -> bool:
@@ -45,34 +115,33 @@ def find_filename(filename: str, parent_dir: str) -> typing.Optional[str]:
             parent_dir = next_parent_dir
 
 
-def check_handler(d: dict) -> None:
+def validate_handler_config(d: dict) -> None:
     """Raises ValueError if the config makes no sense. Else returns None."""
+    if 'url' not in d:
+        raise ValueError('Invalid handler, missing "url"')
 
-def make_handler(handler_dict: dict):
-    """Convert an app.yaml handler to a WSGI route handler?"""
-    # - script: auto then it's a Python handler.
-    # - static_files: .* then it's a static handler, serving upload:
-    # - static_dir: .* then it's a static handler, serving the directory
-    check_handler(handler_dict)
+    defined = set(d)
+    permitted = set(['script', 'static_dir', 'static_files'])
+    num_valid = len(defined & permitted)
 
-def read_static_handlers(config_filename) -> list:
+    if num_valid != 1:
+        choices = ', '.join(sorted(permitted))
+        raise ValueError('Invalid handler, must define exactly 1 of %s' % choices)
+
+
+def read_handler_config(config_filename: str) -> typing.Iterable:
     cwd = os.getcwd()
     yaml_filename = find_filename(config_filename, cwd)
 
     with open(yaml_filename) as fh:
         config = yaml.safe_load(fh)
 
-    for handler in config['handlers']:
-        make_handler(handler)
+    for conf in config['handlers']:
+        validate_handler_config(conf)
+        yield conf
 
 
-def new_service(config_filename):
-    handlers = read_static_handlers(config_filename)
-
-    return
-
-
-def devserver(app):
+def devserver(app=App.not_found, config=None, config_filename=DEFAULT_SERVICE_YAML):
     """Adds handlers for static routes defined in app.yaml to a WSGI app.
 
     For each handler in app.yaml which defines a static_file or static_dir
@@ -89,7 +158,28 @@ def devserver(app):
     if is_gae(os.environ):
         return app
 
-    server = new_service(DEFAULT_SERVICE_YAML)
-    wrapper = server(app)
+    if config is None:
+        config = read_handler_config(config_filename)
+
+    routes = []
+
+    for handler_config in config:
+
+        if 'script' in handler_config:
+            handler = app
+            pattern = r'^' + handler_config['url']
+
+        elif 'static_dir' in handler_config:
+            pattern = re.compile(r'^' + handler_config['url'] + r'(.*)')
+            static_dir = handler_config['static_dir']
+            handler = functools.partial(App.static_dir, pattern, static_dir)
+
+        elif 'static_files' in handler_config:
+            handler = App.static_dir
+            pattern = r'^' + handler_config['url']
+
+        routes.append((pattern, handler))
+
+    wrapper = App(routes=routes)
 
     return wrapper
