@@ -1,6 +1,5 @@
 import io
 import os.path
-import shutil
 import tempfile
 import unittest
 
@@ -11,15 +10,6 @@ import werkzeug
 import devserver
 
 
-app_yaml = io.StringIO("""
-runtime: python37
-
-handlers:
-
-  - url: /
-    static_dir: dist
-
-""")
 class ValidateHandlerConfigTestCase(unittest.TestCase):
     def test_invalid_multiple_types(self):
         handler = {
@@ -52,7 +42,7 @@ class ValidateHandlerConfigTestCase(unittest.TestCase):
 
 
 class DevserverTestCase(unittest.TestCase):
-    def test_devserver_page_not_found(self):
+    def test_page_not_found(self):
         config = [
             {
                 'url': '/static',
@@ -65,30 +55,53 @@ class DevserverTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
-    def test_devserver_serve_file(self):
-        static_dir = tempfile.mkdtemp()
-        foo_filename = os.path.join(static_dir, 'foo.txt')
+    def test_serve_static_dir(self):
+        with tempfile.TemporaryDirectory() as static_dir:
+            foo_filename = os.path.join(static_dir, 'foo.txt')
 
-        with open(foo_filename, 'w') as fh:
-            fh.write('foo!')
+            with open(foo_filename, 'w') as fh:
+                fh.write('foo!')
 
-        config = [
-            {
-                'url': '/static',
-                'static_dir': static_dir,
-            },
-        ]
+            config = [
+                {
+                    'url': '/static',
+                    'static_dir': static_dir,
+                },
+            ]
 
-        try:
             app = devserver.devserver(config=config)
             client = werkzeug.Client(app, werkzeug.Response)
             response = client.get('/static/foo.txt')
-        finally:
-            shutil.rmtree(static_dir)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers, {})
+        self.assertEqual(response.headers['Content-Type'], 'text/plain')
+        self.assertEqual(response.headers['Cache-Control'], 'public')
+        self.assertEqual(response.headers['Content-Length'], '4')
+        self.assertEqual(response.data, b'foo!')
 
+    def test_serve_static_files(self):
+        with tempfile.TemporaryDirectory() as static_dir:
+            foo_filename = os.path.join(static_dir, 'foo.txt')
+
+            with open(foo_filename, 'w') as fh:
+                fh.write('foo!')
+
+            config = [
+                {
+                    'url': r'/static/(.*\.txt)$',
+                    'static_files': static_dir + r'/\1',
+                },
+            ]
+
+            app = devserver.devserver(config=config)
+            client = werkzeug.Client(app, werkzeug.Response)
+            response = client.get('/static/foo.txt')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['Content-Type'], 'text/plain')
+        self.assertEqual(response.headers['Cache-Control'], 'public')
+        self.assertEqual(response.headers['Content-Length'], '4')
+        self.assertEqual(response.data, b'foo!')
 
 
 if __name__ == '__main__':

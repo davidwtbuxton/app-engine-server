@@ -26,6 +26,7 @@ import typing
 
 import werkzeug
 import werkzeug.http
+import werkzeug.security
 import werkzeug.wsgi
 
 
@@ -62,15 +63,31 @@ class App(object):
         path_info = werkzeug.wsgi.get_path_info(environ)
 
         try:
-            # If it is a match we get a pair of ['', '/filename.txt'].
-             _, remainder = url_pattern.split(path_info)
+            # If it is a match we get a triple of ['', '/filename.txt', ''].
+             _, remainder, _ = url_pattern.split(path_info)
         except ValueError:
             return cls.not_found(environ, start_response)
 
         remainder = remainder.lstrip('/')
-        filename = os.path.join(static_dir, remainder)
-        content_type = mimetypes.guess_type(filename) or DEFAULT_CONTENT_TYPE
-        mtime = datetime.utcfromtimestamp(os.path.getmtime(filename))
+        filename = werkzeug.security.safe_join(static_dir, remainder)
+
+        return cls._file_response(filename, environ, start_response)
+
+    @classmethod
+    def static_files(cls, url_pattern, static_files, environ, start_response):
+        path_info = werkzeug.wsgi.get_path_info(environ)
+
+        if url_pattern.search(path_info):
+            filename = url_pattern.sub(static_files, path_info)
+
+            return cls._file_response(filename, environ, start_response)
+        else:
+            return cls.not_found(environ, start_response)
+
+    @classmethod
+    def _file_response(cls, filename, environ, start_response):
+        content_type, _ = mimetypes.guess_type(filename) or DEFAULT_CONTENT_TYPE
+        mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(filename))
         size = int(os.path.getsize(filename))
 
         headers = [
@@ -175,8 +192,12 @@ def devserver(app=App.not_found, config=None, config_filename=DEFAULT_SERVICE_YA
             handler = functools.partial(App.static_dir, pattern, static_dir)
 
         elif 'static_files' in handler_config:
-            handler = App.static_dir
-            pattern = r'^' + handler_config['url']
+            # - url: /(.*\.(gif|png|jpg))$
+            #   static_files: static/\1
+            #   upload: static/.*\.(gif|png|jpg)$
+            pattern = re.compile(r'^' + handler_config['url'])
+            static_files = handler_config['static_files']
+            handler = functools.partial(App.static_files, pattern, static_files)
 
         routes.append((pattern, handler))
 
